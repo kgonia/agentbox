@@ -186,14 +186,15 @@ user=$(field remoteUser)
 wsdir=$(field remoteWorkspaceFolder)
 [[ -n $cid ]] || die "unexpected output from devcontainer up: $result"
 
-# Docker creates a new volume owned by root; give it to the container user.
-# A shared history folder belongs to the host and is left alone.
+# Give the volume to the container user. Docker creates a new volume, and the
+# mount point for shared history inside it, owned by root; a container with
+# another user may have run on it too. A shared history folder belongs to the
+# host and is left alone, and symlinks are not followed.
 skip=
 $SHARE && skip=$CONFIG_DIR/projects
 docker exec -u root "$cid" sh -c '
   u=$(id -u "$1") g=$(id -g "$1")
-  [ "$(stat -c %u "$2")" = "$u" ] ||
-    find "$2" -path "$3" -prune -o -exec chown "$u:$g" {} +' sh "${user:-root}" "$CONFIG_DIR" "$skip"
+  find "$2" -path "$3" -prune -o ! -user "$u" -exec chown -h "$u:$g" {} +' sh "${user:-root}" "$CONFIG_DIR" "$skip"
 
 # Start in the same folder as on the host.
 if $SHARE; then
