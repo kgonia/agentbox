@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# claudebox: run Claude Code inside the current project's dev container.
+#
+# Starts the container from the project's own devcontainer.json with the Dev
+# Containers CLI, adds Claude Code on top of it without editing the project,
+# and runs `claude` in it. See README.md.
+set -euo pipefail
+
+CLAUDEBOX_HOME=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+VOLUME=${CLAUDEBOX_VOLUME:-claude-config}
+CONFIG_DIR=/claude-config
+# The Node feature is listed because the Claude feature's own Node fallback
+# fails on current Ubuntu images. Options a project sets for Node still win.
+FEATURES='{"ghcr.io/devcontainers/features/node:1":{},"ghcr.io/anthropics/devcontainer-features/claude-code:1":{}}'
+
+usage() {
+  cat <<EOF
+Usage: claudebox [options] [--] [claude args...]
+
+Runs Claude Code in the dev container defined by the nearest .devcontainer,
+searching up from the current directory. .devcontainer/claude/devcontainer.json
+is preferred over .devcontainer/devcontainer.json and .devcontainer.json.
+Without any of them, a plain Ubuntu container is used.
+
+Options:
+  --rebuild       recreate the container from its definition, then continue
+  --shell         open a shell in the container instead of claude
+  --rm            remove this project's claudebox containers and exit
+  --config FILE   use FILE as devcontainer.json
+  -h, --help      show this help
+
+Arguments after the options (or after --) are passed to claude.
+
+Environment:
+  CLAUDEBOX_VOLUME  Docker volume for Claude's config and login
+                    (default: claude-config, shared by all projects)
+EOF
+}
+
+die() { echo "claudebox: $*" >&2; exit 1; }
+# A container whose start commands failed (say, a firewall that never came up)
+# would otherwise be reused as is on the next run.
+up_failed() { die "devcontainer up failed: $1
+claudebox: run 'claudebox --rebuild' once the cause is fixed"; }
+
+rebuild=false shell=false remove=false config=
+while (($#)); do
+  case $1 in
+    --rebuild) rebuild=true ;;
+    --shell) shell=true ;;
+    --rm) remove=true ;;
+    --config)
+      [[ $# -ge 2 && -f $2 ]] || die "--config needs an existing file"
+      config=$(readlink -f -- "$2"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+  shift
+done
+
+command -v docker >/dev/null || die "docker not found"
+command -v devcontainer >/dev/null ||
+  die "devcontainer not found; install it with: npm install -g @devcontainers/cli"
+
+here=$(pwd -P)
+
+find_config() {
+  local f
+  for f in .devcontainer/claude/devcontainer.json .devcontainer/devcontainer.json .devcontainer.json; do
+    [[ -f $1/$f ]] && { echo "$1/$f"; return 0; }
+  done
+  return 1
+}
+
+# The workspace root is the folder holding .devcontainer (or .devcontainer.json).
+if [[ -n $config ]]; then
+  case $config in
+    */.devcontainer/*) root=${config%%/.devcontainer/*} ;;
+    */.devcontainer.json) root=${config%/.devcontainer.json} ;;
+    *) root=$here ;;
+  esac
+  cfg_args=(--config "$config")
+else
+  dir=$here
+  while ! config=$(find_config "$dir"); do
+    [[ $dir == / ]] && break
+    dir=$(dirname -- "$dir")
+  done
+  if [[ -n $config ]]; then
+    root=$dir
+    cfg_args=(--config "$config")
+  else
+    root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "$here")
+    config=$CLAUDEBOX_HOME/default/devcontainer.json
+    cfg_args=(--override-config "$config")
+  fi
+fi
+
+# Our own id labels keep claudebox's container apart from one VS Code made for
+# the same folder, which would not have Claude installed.
+ids=(--id-label "claudebox.folder=$root" --id-label "claudebox.config=$config")
+
+if $remove; then
+  containers=$(docker ps -aq --filter "label=claudebox.folder=$root")
+  if [[ -n $containers ]]; then
+    # shellcheck disable=SC2086
+    docker rm -f $containers >/dev/null
+    echo "claudebox: removed containers for $root"
+  else
+    echo "claudebox: no containers for $root"
+  fi
+  exit 0
+fi
+
+up=(devcontainer up --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}"
+  --no-lockfile # otherwise the CLI writes our features into the project's lockfile
+  --additional-features "$FEATURES"
+  --mount "type=volume,source=$VOLUME,target=$CONFIG_DIR"
+  --remote-env "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
+$rebuild && up+=(--remove-existing-container)
+
+# Building shows useful progress on stderr; starting an existing container
+# only prints a version banner, so keep that quiet unless it fails.
+existing=$(docker ps -aq --filter "label=claudebox.folder=$root" --filter "label=claudebox.config=$config")
+if [[ -n $existing ]] && ! $rebuild; then
+  log=$(mktemp)
+  result=$("${up[@]}" 2>"$log") || { cat "$log" >&2; rm -f "$log"; up_failed "$result"; }
+  rm -f "$log"
+else
+  echo "claudebox: building dev container for $root" >&2
+  result=$("${up[@]}") || up_failed "$result"
+fi
+
+field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" <<<"$result"; }
+cid=$(field containerId)
+user=$(field remoteUser)
+wsdir=$(field remoteWorkspaceFolder)
+[[ -n $cid ]] || die "unexpected output from devcontainer up: $result"
+
+# Docker creates a new volume owned by root; give it to the container user.
+docker exec -u root "$cid" sh -c '
+  u=$(id -u "$1") g=$(id -g "$1")
+  [ "$(stat -c %u "$2")" = "$u" ] || chown -R "$u:$g" "$2"' sh "${user:-root}" "$CONFIG_DIR"
+
+# Start in the same subfolder of the project as on the host.
+rel=
+[[ $here == "$root"/* ]] && rel=${here#"$root"}
+
+if $shell; then
+  cmd=(sh -c 'command -v bash >/dev/null && exec bash || exec sh')
+else
+  cmd=(claude "$@")
+fi
+
+# The CLI sets TERM=xterm otherwise; pass the host's so colors match.
+env_args=(--remote-env "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
+[[ -n ${TERM-} ]] && env_args+=(--remote-env "TERM=$TERM")
+[[ -n ${COLORTERM-} ]] && env_args+=(--remote-env "COLORTERM=$COLORTERM")
+
+exec devcontainer exec --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}" "${env_args[@]}" \
+  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$wsdir$rel" "${cmd[@]}"

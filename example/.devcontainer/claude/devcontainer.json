@@ -1,0 +1,12 @@
+{
+  // Claude-only variant of ../devcontainer.json: same image, plus an outbound
+  // firewall. claudebox picks this file over ../devcontainer.json.
+  "name": "claudebox-example (claude)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+  // The Claude Code feature installs init-firewall.sh. Its v1.0.5 exits when a
+  // domain on its list no longer resolves (statsig.anthropic.com), so the sed
+  // skips such domains instead. postStart, not postCreate: the rules are lost
+  // whenever the container stops.
+  "postStartCommand": "sed '/Failed to resolve/{n;s/exit 1/continue/}' /usr/local/bin/init-firewall.sh | sudo bash"
+}
