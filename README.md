@@ -110,7 +110,10 @@ commands on your host.
 3. **Gives the volume to the container's user**, because Docker creates it
    owned by root.
 4. **Runs `claude` with `devcontainer exec`**, in the same subfolder you are
-   in on the host, with your `TERM` and `COLORTERM`.
+   in on the host, with your `TERM` and `COLORTERM`. If the image installs
+   skills, commands or agents in the container user's `~/.claude`, claudebox
+   adds that home folder with `--add-dir`. Otherwise Claude wouldn't load them,
+   because its config folder is the volume.
 
 The first build takes a minute or more. After that the container stays
 running and `claudebox` takes under a second. Changes to `devcontainer.json`

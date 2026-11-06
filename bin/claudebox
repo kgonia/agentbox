@@ -207,7 +207,10 @@ fi
 if $shell; then
   cmd=(sh -c 'command -v bash >/dev/null && exec bash || exec sh')
 else
-  cmd=(claude "$@")
+  # CLAUDE_CONFIG_DIR hides the skills, commands and agents an image installs
+  # in ~/.claude; --add-dir loads them. With "=", a prompt right after it isn't
+  # taken as another folder.
+  cmd=(sh -c '[ -d "$HOME/.claude" ] && set -- --add-dir="$HOME" "$@"; exec claude "$@"' claude "$@")
 fi
 
 # The CLI sets TERM=xterm otherwise; pass the host's so colors match.
