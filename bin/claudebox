@@ -7,7 +7,7 @@
 set -euo pipefail
 
 CLAUDEBOX_HOME=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
-VOLUME=${CLAUDEBOX_VOLUME:-claude-config}
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/config
 CONFIG_DIR=/claude-config
 # The Node feature is listed because the Claude feature's own Node fallback
 # fails on current Ubuntu images. Options a project sets for Node still win.
@@ -23,17 +23,22 @@ is preferred over .devcontainer/devcontainer.json and .devcontainer.json.
 Without any of them, a plain Ubuntu container is used.
 
 Options:
-  --rebuild       recreate the container from its definition, then continue
-  --shell         open a shell in the container instead of claude
-  --rm            remove this project's claudebox containers and exit
-  --config FILE   use FILE as devcontainer.json
-  -h, --help      show this help
+  --rebuild             recreate the container from its definition, then continue
+  --shell               open a shell in the container instead of claude
+  --rm                  remove this project's claudebox containers and exit
+  --config FILE         use FILE as devcontainer.json
+  --share-history       share chat history with Claude on the host; this
+                        project keeps sharing until --no-share-history
+  --no-share-history    stop sharing chat history for this project
+  -h, --help            show this help
 
 Arguments after the options (or after --) are passed to claude.
 
-Environment:
-  CLAUDEBOX_VOLUME  Docker volume for Claude's config and login
-                    (default: claude-config, shared by all projects)
+Config file $CONF (plain shell):
+  CLAUDEBOX_SHARE_HISTORY=yes  share history in new containers (default: no)
+  CLAUDEBOX_VOLUME=NAME        Docker volume for Claude's login and config
+                               (default: claude-config, shared by all projects;
+                               the environment variable overrides the file)
 EOF
 }
 
@@ -43,12 +48,27 @@ die() { echo "claudebox: $*" >&2; exit 1; }
 up_failed() { die "devcontainer up failed: $1
 claudebox: run 'claudebox --rebuild' once the cause is fixed"; }
 
-rebuild=false shell=false remove=false config=
+# History sharing is set with flags and the config file only, never from the
+# environment; the volume may also come from the environment.
+env_volume=${CLAUDEBOX_VOLUME-}
+unset CLAUDEBOX_SHARE_HISTORY
+# shellcheck source=/dev/null
+[[ -f $CONF ]] && source "$CONF"
+VOLUME=${env_volume:-${CLAUDEBOX_VOLUME:-claude-config}}
+case ${CLAUDEBOX_SHARE_HISTORY:-no} in
+  yes|true|on|1) default_share=true ;;
+  no|false|off|0) default_share=false ;;
+  *) die "CLAUDEBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
+esac
+
+rebuild=false shell=false remove=false config= share_flag=
 while (($#)); do
   case $1 in
     --rebuild) rebuild=true ;;
     --shell) shell=true ;;
     --rm) remove=true ;;
+    --share-history) share_flag=true ;;
+    --no-share-history) share_flag=false ;;
     --config)
       [[ $# -ge 2 && -f $2 ]] || die "--config needs an existing file"
       config=$(readlink -f -- "$2"); shift ;;
@@ -113,23 +133,51 @@ if $remove; then
   exit 0
 fi
 
+existing=$(docker ps -aq --filter "label=claudebox.folder=$root" --filter "label=claudebox.config=$config" | head -n1)
+
+# Sharing history takes mounts, which are fixed when a container is created.
+# A flag switches this project's container; without one, an existing container
+# keeps its mode and a new one gets the default from the config file.
+existing_share=
+if [[ -n $existing ]]; then
+  dests=$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$existing")
+  existing_share=false
+  grep -qxF "$CONFIG_DIR/projects" <<<"$dests" && existing_share=true
+fi
+SHARE=${share_flag:-${existing_share:-$default_share}}
+if [[ -n $existing_share && $SHARE != "$existing_share" ]] && ! $rebuild; then
+  echo "claudebox: history sharing turned $($SHARE && echo on || echo off), recreating the container" >&2
+  rebuild=true
+fi
+
+mounts=(--mount "type=volume,source=$VOLUME,target=$CONFIG_DIR")
+if $SHARE; then
+  # Claude files history under the project's path, so the project also has to
+  # be at its host path in the container: its git root, so git still works.
+  history=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+  top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || echo "$root")
+  mkdir -p "$history"
+  mounts+=(--mount "type=bind,source=$history,target=$CONFIG_DIR/projects"
+    --mount "type=bind,source=$top,target=$top")
+fi
+
 up=(devcontainer up --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}"
   --no-lockfile # otherwise the CLI writes our features into the project's lockfile
   --additional-features "$FEATURES"
-  --mount "type=volume,source=$VOLUME,target=$CONFIG_DIR"
+  "${mounts[@]}"
   --remote-env "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 $rebuild && up+=(--remove-existing-container)
 
 # Building shows useful progress on stderr; starting an existing container
 # only prints a version banner, so keep that quiet unless it fails.
-existing=$(docker ps -aq --filter "label=claudebox.folder=$root" --filter "label=claudebox.config=$config")
 if [[ -n $existing ]] && ! $rebuild; then
   log=$(mktemp)
-  result=$("${up[@]}" 2>"$log") || { cat "$log" >&2; rm -f "$log"; up_failed "$result"; }
+  result=$("${up[@]}" </dev/null 2>"$log") || { cat "$log" >&2; rm -f "$log"; up_failed "$result"; }
   rm -f "$log"
 else
   echo "claudebox: building dev container for $root" >&2
-  result=$("${up[@]}") || up_failed "$result"
+  # stdin is for claude: building would otherwise read it.
+  result=$("${up[@]}" </dev/null) || up_failed "$result"
 fi
 
 field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" <<<"$result"; }
@@ -139,13 +187,21 @@ wsdir=$(field remoteWorkspaceFolder)
 [[ -n $cid ]] || die "unexpected output from devcontainer up: $result"
 
 # Docker creates a new volume owned by root; give it to the container user.
+# A shared history folder belongs to the host and is left alone.
+skip=
+$SHARE && skip=$CONFIG_DIR/projects
 docker exec -u root "$cid" sh -c '
   u=$(id -u "$1") g=$(id -g "$1")
-  [ "$(stat -c %u "$2")" = "$u" ] || chown -R "$u:$g" "$2"' sh "${user:-root}" "$CONFIG_DIR"
+  [ "$(stat -c %u "$2")" = "$u" ] ||
+    find "$2" -path "$3" -prune -o -exec chown "$u:$g" {} +' sh "${user:-root}" "$CONFIG_DIR" "$skip"
 
-# Start in the same subfolder of the project as on the host.
-rel=
-[[ $here == "$root"/* ]] && rel=${here#"$root"}
+# Start in the same folder as on the host.
+if $SHARE; then
+  workdir=$here
+else
+  workdir=$wsdir
+  [[ $here == "$root"/* ]] && workdir+=${here#"$root"}
+fi
 
 if $shell; then
   cmd=(sh -c 'command -v bash >/dev/null && exec bash || exec sh')
@@ -159,4 +215,4 @@ env_args=(--remote-env "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 [[ -n ${COLORTERM-} ]] && env_args+=(--remote-env "COLORTERM=$COLORTERM")
 
 exec devcontainer exec --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}" "${env_args[@]}" \
-  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$wsdir$rel" "${cmd[@]}"
+  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$workdir" "${cmd[@]}"

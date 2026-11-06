@@ -28,18 +28,65 @@ ln -s "$PWD/bin/claudebox" ~/.local/bin/claudebox
 ```
 claudebox [options] [--] [claude args...]
 
-  --rebuild       recreate the container from its definition, then continue
-  --shell         open a shell in the container instead of claude
-  --rm            remove this project's claudebox containers and exit
-  --config FILE   use FILE as devcontainer.json
-  -h, --help      show this help
+  --rebuild             recreate the container from its definition, then continue
+  --shell               open a shell in the container instead of claude
+  --rm                  remove this project's claudebox containers and exit
+  --config FILE         use FILE as devcontainer.json
+  --share-history       share chat history with Claude on the host; this
+                        project keeps sharing until --no-share-history
+  --no-share-history    stop sharing chat history for this project
+  -h, --help            show this help
 ```
 
 Arguments after the options go to `claude`. Use `--` to pass one that
 claudebox would take itself: `claudebox -- --help` shows Claude's help.
 
-`CLAUDEBOX_VOLUME` names the Docker volume for Claude's config and login
-(default `claude-config`).
+## Settings
+
+`~/.config/claudebox/config` is plain shell:
+
+```sh
+CLAUDEBOX_SHARE_HISTORY=yes     # share history in new containers (default: no)
+CLAUDEBOX_VOLUME=claude-config  # Docker volume for Claude's login and config
+```
+
+`CLAUDEBOX_VOLUME` can also be set in the environment, which overrides the
+file. History sharing can't: it's controlled by the flags below and the file.
+
+## Sharing history with Claude on the host
+
+```sh
+claudebox --share-history       # turn it on for this project
+claudebox                       # stays on
+claudebox --no-share-history    # turn it off again
+```
+
+With sharing on, `claude --resume` on the host lists the sessions from the
+container, and the other way round. Per-project memory is shared too. The
+login and settings still come from the volume.
+
+Claude files history by project path, as in
+`~/.claude/projects/-home-you-Projects-repo/`. So claudebox:
+
+- mounts the host's `~/.claude/projects` at `/claude-config/projects`;
+- also mounts the project's git root at its host path, and starts Claude there
+  instead of under `/workspaces`.
+
+A container keeps the mounts it was created with, so each project's container
+remembers its mode:
+
+- A flag that changes the mode recreates the container once.
+- Without a flag, an existing container keeps its mode, including through
+  `--rebuild`.
+- A new container, for example after `claudebox --rm`, takes the default from
+  the config file.
+
+Changing the config file doesn't affect existing containers. While sharing is
+on, the history stored in the volume is hidden, not deleted.
+
+Only `projects/` is shared, never all of `~/.claude`. That folder also holds
+`settings.json` and hooks, which a project's script could change to run
+commands on your host.
 
 ## What it does
 
@@ -91,6 +138,13 @@ docker volume rm claude-config                                  # forget the log
   `CLAUDEBOX_VOLUME=claude-untrusted claudebox`. If projects run as users with
   different UIDs, claudebox re-owns the volume each time you switch between
   them.
+- **Shared history is open to every container.** With sharing on, anything
+  running in a project's container can read all of your host chat history,
+  including projects that never ran in claudebox. It can also write
+  transcripts and memory that Claude on the host loads later. Keep sharing off
+  for a repo you don't trust. Sharing also assumes the container's user has
+  your UID, which the Dev Containers CLI arranges on Linux. A container
+  running as root would leave root-owned files in your history.
 - **A firewall can't be added from outside.** It needs `--cap-add=NET_ADMIN`
   and a start command in the definition itself. Write a Claude-only variant in
   `.devcontainer/claude/devcontainer.json`, which claudebox prefers. Build it
