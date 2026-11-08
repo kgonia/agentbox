@@ -1,7 +1,9 @@
 {
-  // Claude-only variant of ../devcontainer.json: same image, plus an outbound
-  // firewall. claudebox picks this file over ../devcontainer.json.
-  "name": "claudebox-example (claude)",
+  // The agents' variant of ../devcontainer.json: same image, plus an outbound
+  // firewall. agentbox picks this file over ../devcontainer.json. The firewall
+  // script comes with Claude Code and lets through only what Claude needs, so
+  // this variant is for running claude.
+  "name": "agentbox-example (agents)",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
   // The Claude Code feature installs init-firewall.sh. Its v1.0.5 exits when a

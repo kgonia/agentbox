@@ -1,4 +1,4 @@
 {
-  "name": "claudebox",
+  "name": "agentbox",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu"
 }

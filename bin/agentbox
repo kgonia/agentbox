@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# agentbox: run a coding agent inside the current project's dev container.
+#
+# Starts the container from the project's own devcontainer.json with the Dev
+# Containers CLI, adds agents to it without editing the project, and runs one.
+# Each agent is a profile in agents/, and one container per project serves all
+# of them. See README.md.
+set -euo pipefail
+
+AGENTBOX_HOME=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/agentbox/config
+
+die() { echo "agentbox: $*" >&2; exit 1; }
+# A container whose start commands failed (say, a firewall that never came up)
+# would otherwise be reused as is on the next run.
+up_failed() { die "devcontainer up failed: $1
+agentbox: run 'agentbox --rebuild ...' once the cause is fixed"; }
+
+# Asks on the terminal, so it works while stdin is piped to the agent; --yes
+# answers yes, and without a terminal to ask on, agentbox stops.
+confirm() {
+  $yes && return 0
+  { : </dev/tty; } 2>/dev/null || die "$1
+agentbox: there's no terminal to ask on; pass --yes to go ahead"
+  local answer=
+  printf 'agentbox: %s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty || true
+  [[ $answer == [yY]* ]]
+}
+
+known_agents() {
+  local f
+  for f in "$AGENTBOX_HOME"/agents/*.sh; do basename -- "$f" .sh; done | paste -sd' ' -
+}
+
+usage() {
+  cat <<EOF
+Usage: agentbox [options] AGENT [agent args...]
+       agentbox [options] --shell [AGENT]
+
+Runs AGENT ($(known_agents)) in the dev container defined by the nearest
+.devcontainer, searching up from the current directory:
+.devcontainer/agentbox/devcontainer.json first, then .devcontainer/devcontainer.json
+and .devcontainer.json. Without any of them, agentbox offers a plain Ubuntu
+container. Each project has one container, shared by every agent run in it.
+Invoked as claudebox, AGENT is claude.
+
+Options (before AGENT; arguments after it go to the agent):
+  --rebuild             recreate the container from its definition, then continue
+  --shell               open a shell in the container instead of an agent
+  --rm                  remove this project's agentbox containers and exit
+  --config FILE         use FILE as devcontainer.json
+  --share-history       share chat history with the agents on the host (those
+                        whose profile supports it); this project keeps sharing
+                        until --no-share-history
+  --no-share-history    stop sharing chat history for this project
+  --keep-running        leave the container running when this session ends
+                        (by default the last session to end stops it)
+  -y, --yes             answer yes to agentbox's questions: whether to start
+                        a plain container where there is no .devcontainer, and
+                        whether to recreate a container (which ends the
+                        sessions in it)
+  -h, --help            show this help
+
+Config file $CONF (plain shell):
+  AGENTBOX_SHARE_HISTORY=yes     share history in new containers (default: no)
+  AGENTBOX_VOLUME_PREFIX=PREFIX  prefix for the volumes holding each agent's login
+                                 and config, named <agent>-config (default: none;
+                                 the environment variable overrides the file)
+EOF
+}
+
+# History sharing is set with flags and the config file only, never from the
+# environment; the volume prefix may also come from the environment.
+env_prefix=${AGENTBOX_VOLUME_PREFIX-}
+unset AGENTBOX_SHARE_HISTORY
+# shellcheck source=/dev/null
+[[ -f $CONF ]] && source "$CONF"
+PREFIX=${env_prefix:-${AGENTBOX_VOLUME_PREFIX:-}}
+case ${AGENTBOX_SHARE_HISTORY:-no} in
+  yes|true|on|1) default_share=true ;;
+  no|false|off|0) default_share=false ;;
+  *) die "AGENTBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
+esac
+
+rebuild=false shell=false remove=false keep=false yes=false config= share_flag=
+while (($#)); do
+  case $1 in
+    --rebuild) rebuild=true ;;
+    -y|--yes) yes=true ;;
+    --shell) shell=true ;;
+    --rm) remove=true ;;
+    --keep-running) keep=true ;;
+    --share-history) share_flag=true ;;
+    --no-share-history) share_flag=false ;;
+    --config)
+      [[ $# -ge 2 && -f $2 ]] || die "--config needs an existing file"
+      config=$(readlink -f -- "$2"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+  shift
+done
+
+agent=
+if [[ $(basename -- "$0") == claudebox ]]; then
+  agent=claude
+elif (($#)); then
+  agent=$1; shift
+elif ! $shell && ! $remove; then
+  usage >&2; exit 2
+fi
+[[ -z $agent || -f $AGENTBOX_HOME/agents/$agent.sh ]] ||
+  die "no agent called '$agent' (there are: $(known_agents))"
+
+command -v docker >/dev/null || die "docker not found"
+command -v devcontainer >/dev/null ||
+  die "devcontainer not found; install it with: npm install -g @devcontainers/cli"
+
+here=$(pwd -P)
+
+find_config() {
+  local f
+  for f in .devcontainer/agentbox/devcontainer.json .devcontainer/devcontainer.json .devcontainer.json; do
+    [[ -f $1/$f ]] && { echo "$1/$f"; return 0; }
+  done
+  return 1
+}
+
+# The workspace root is the folder holding .devcontainer (or .devcontainer.json).
+plain=false
+if [[ -n $config ]]; then
+  case $config in
+    */.devcontainer/*) root=${config%%/.devcontainer/*} ;;
+    */.devcontainer.json) root=${config%/.devcontainer.json} ;;
+    *) root=$here ;;
+  esac
+  cfg_args=(--config "$config")
+else
+  dir=$here
+  while ! config=$(find_config "$dir"); do
+    [[ $dir == / ]] && break
+    dir=$(dirname -- "$dir")
+  done
+  if [[ -n $config ]]; then
+    root=$dir
+    cfg_args=(--config "$config")
+  else
+    root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "$here")
+    config=$AGENTBOX_HOME/default/devcontainer.json
+    cfg_args=(--override-config "$config")
+    plain=true
+  fi
+fi
+
+# Our own id labels keep agentbox's container apart from one VS Code made for
+# the same folder, which would not have the agents installed.
+ids=(--id-label "agentbox.folder=$root" --id-label "agentbox.config=$config")
+
+if $remove; then
+  containers=$(docker ps -aq --filter "label=agentbox.folder=$root")
+  if [[ -n $containers ]]; then
+    # shellcheck disable=SC2086
+    docker rm -f $containers >/dev/null
+    echo "agentbox: removed containers for $root"
+  else
+    echo "agentbox: no containers for $root"
+  fi
+  exit 0
+fi
+
+# Every session in this project's container holds a shared lock while it runs,
+# so the last one to end can stop the container. It's taken before the
+# container starts, so a session that is just starting can't be cut off.
+# Without flock, the container keeps running.
+key=$(printf '%s' "$root|$config" | cksum | cut -d' ' -f1)
+exec {lock_fd}>"${XDG_RUNTIME_DIR:-/tmp}/agentbox-$UID-$key.lock"
+have_flock=false
+command -v flock >/dev/null && have_flock=true
+$have_flock && flock -s "$lock_fd"
+
+existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=agentbox.config=$config" | head -n1)
+
+# The container's mounts tell what it was created with, and mounts are fixed
+# at creation: each agent's config volume is at /<agent>-config, and with
+# shared history, a host folder is mounted inside one of them.
+agents=() existing_share= other_volumes=false
+if [[ -n $existing ]]; then
+  current=$(docker inspect -f '{{range .Mounts}}{{println .Destination .Name}}{{end}}' "$existing")
+  while read -r d name; do
+    [[ $d =~ ^/([a-z0-9_-]+)-config$ ]] || continue
+    a=${BASH_REMATCH[1]}
+    [[ -f $AGENTBOX_HOME/agents/$a.sh ]] || continue
+    agents+=("$a")
+    # set up with another AGENTBOX_VOLUME_PREFIX
+    [[ $name == "$PREFIX$a-config" ]] || other_volumes=true
+  done <<<"$current"
+  existing_share=false
+  grep -qE '^/[a-z0-9_-]+-config/.' <<<"$current" && existing_share=true
+fi
+
+if $plain && [[ -z $existing ]]; then
+  confirm "There's no .devcontainer here or in any folder above. Start a plain Ubuntu container for $root?" ||
+    die "nothing started"
+fi
+
+# Whether other sessions are using the container: they hold the lock shared.
+# Waiting a moment lets a session that is only stopping the container finish.
+others_running() {
+  if ! $have_flock; then
+    [[ $(docker inspect -f '{{.State.Running}}' "$existing") == true ]]
+    return
+  fi
+  flock -u "$lock_fd"
+  if flock -x -w 2 "$lock_fd"; then flock -s "$lock_fd"; return 1; fi
+  flock -s "$lock_fd"
+}
+
+# A flag switches history sharing for this project's container; without one, an
+# existing container keeps its mode and a new one gets the config file's.
+SHARE=${share_flag:-${existing_share:-$default_share}}
+missing=false
+[[ -n $agent && " ${agents[*]} " != *" $agent "* ]] && missing=true
+
+# Recreating the container ends every session in it and drops whatever was
+# installed in it outside the volumes. So ask first: always when the container
+# has to be recreated for a flag or a new agent, and on --rebuild when other
+# sessions are using it.
+if [[ -n $existing ]]; then
+  why=
+  if ! $rebuild; then
+    [[ $SHARE != "$existing_share" ]] && why+=", to turn history sharing $($SHARE && echo on || echo off)"
+    $missing && why+=", to add $agent"
+    $other_volumes && why+=", to use the volumes named ${PREFIX}<agent>-config"
+  fi
+  if [[ -n $why ]] || $rebuild; then
+    ends=
+    others_running && ends=", and ends the other sessions running in it"
+    if [[ -n $why ]]; then
+      confirm "This project's container has to be recreated${why#,}. That drops anything installed in it outside the volumes$ends. Go ahead?" ||
+        die "nothing changed"
+    elif [[ -n $ends ]]; then
+      confirm "--rebuild recreates this project's container${ends#,}. Go ahead?" || die "nothing changed"
+    fi
+    rebuild=true
+  fi
+fi
+$missing && agents+=("$agent")
+
+# What every agent in the container needs: its features, its config volume
+# (and the variable pointing at it), and, when sharing, the host's history.
+load() {
+  AGENT_FEATURES=() AGENT_ENV= AGENT_HISTORY= AGENT_HOST_HISTORY= AGENT_RUN='exec "$0" "$@"'
+  # shellcheck source=/dev/null
+  source "$AGENTBOX_HOME/agents/$1.sh"
+}
+features= mounts=() env_args=() owned=()
+declare -A seen=()
+for a in "${agents[@]}"; do
+  load "$a"
+  dir=/$a-config
+  for f in "${AGENT_FEATURES[@]}"; do
+    [[ -n ${seen[$f]-} ]] && continue
+    seen[$f]=1
+    features+="${features:+,}\"$f\":{}"
+  done
+  mounts+=(--mount "type=volume,source=$PREFIX$a-config,target=$dir")
+  env_args+=(--remote-env "$AGENT_ENV=$dir")
+  skip=
+  if $SHARE && [[ -n $AGENT_HISTORY ]]; then
+    mkdir -p "$AGENT_HOST_HISTORY"
+    mounts+=(--mount "type=bind,source=$AGENT_HOST_HISTORY,target=$dir/$AGENT_HISTORY")
+    skip=$dir/$AGENT_HISTORY
+  fi
+  owned+=("$dir|$skip")
+done
+if $SHARE; then
+  # History is filed under the project's path, so the project also has to be at
+  # its host path in the container: its git root, so git still works.
+  top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || echo "$root")
+  mounts+=(--mount "type=bind,source=$top,target=$top")
+fi
+
+up=(devcontainer up --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}"
+  --no-lockfile # otherwise the CLI writes our features into the project's lockfile
+  "${mounts[@]}" "${env_args[@]}")
+[[ -n $features ]] && up+=(--additional-features "{$features}")
+$rebuild && up+=(--remove-existing-container)
+
+# Building shows useful progress on stderr; starting an existing container
+# only prints a version banner, so keep that quiet unless it fails.
+if [[ -n $existing ]] && ! $rebuild; then
+  [[ $(docker inspect -f '{{.State.Running}}' "$existing") == true ]] ||
+    echo "agentbox: starting the dev container" >&2
+  log=$(mktemp)
+  result=$("${up[@]}" </dev/null 2>"$log") || { cat "$log" >&2; rm -f "$log"; up_failed "$result"; }
+  rm -f "$log"
+else
+  echo "agentbox: building dev container for $root" >&2
+  # stdin is for the agent: building would otherwise read it.
+  result=$("${up[@]}" </dev/null) || up_failed "$result"
+fi
+
+field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" <<<"$result"; }
+cid=$(field containerId)
+user=$(field remoteUser)
+wsdir=$(field remoteWorkspaceFolder)
+[[ -n $cid ]] || die "unexpected output from devcontainer up: $result"
+
+# Give the agents' volumes to the container user. Docker creates a new volume,
+# and the mount point for shared history inside it, owned by root; a container
+# with another user may have run on it too. A shared history folder belongs to
+# the host and is left alone, and symlinks are not followed.
+if ((${#owned[@]})); then
+  docker exec -u root "$cid" sh -c '
+    u=$(id -u "$1") g=$(id -g "$1"); shift
+    for p; do
+      find "${p%%|*}" -path "${p#*|}" -prune -o ! -user "$u" -exec chown -h "$u:$g" {} +
+    done' sh "${user:-root}" "${owned[@]}"
+fi
+
+# Start in the same folder as on the host.
+if $SHARE; then
+  workdir=$here
+else
+  workdir=$wsdir
+  [[ $here == "$root"/* ]] && workdir+=${here#"$root"}
+fi
+
+if $shell; then
+  cmd=(sh -c 'command -v bash >/dev/null && exec bash || exec sh')
+else
+  load "$agent"
+  cmd=(sh -c "$AGENT_RUN" "$agent" "$@")
+fi
+
+# The CLI sets TERM=xterm otherwise; pass the host's so colors match.
+[[ -n ${TERM-} ]] && env_args+=(--remote-env "TERM=$TERM")
+[[ -n ${COLORTERM-} ]] && env_args+=(--remote-env "COLORTERM=$COLORTERM")
+
+# Run the session, not exec it, so the container can be stopped afterwards. The
+# HUP trap lets a closed terminal get there too; the session itself still gets
+# the signal.
+trap : HUP
+status=0
+devcontainer exec --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}" "${env_args[@]}" \
+  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$workdir" "${cmd[@]}" {lock_fd}>&- || status=$?
+
+# Stop the container if no other session holds the lock. The stop runs in the
+# background with the lock still open, so the prompt comes back at once and a
+# new session waits until the container is down before starting it again.
+# After a closed terminal, this script's exit sends a hangup to the stop, so it
+# inherits HUP ignored (nohup would leave a moment where it can still be killed).
+if $have_flock && ! $keep; then
+  flock -u "$lock_fd"
+  if flock -xn "$lock_fd"; then
+    trap '' HUP
+    docker stop "$cid" >/dev/null 2>&1 &
+  fi
+fi
+exit "$status"
