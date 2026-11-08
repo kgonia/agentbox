@@ -35,6 +35,8 @@ claudebox [options] [--] [claude args...]
   --share-history       share chat history with Claude on the host; this
                         project keeps sharing until --no-share-history
   --no-share-history    stop sharing chat history for this project
+  --keep-running        leave the container running when this session ends
+                        (by default the last session to end stops it)
   -h, --help            show this help
 ```
 
@@ -115,10 +117,27 @@ commands on your host.
    adds that home folder with `--add-dir`. Otherwise Claude wouldn't load them,
    because its config folder is the volume.
 
-The first build takes a minute or more. After that the container stays
-running and `claudebox` takes under a second. Changes to `devcontainer.json`
-apply only after `claudebox --rebuild`. The volume keeps its contents through
-a rebuild.
+The first build takes a minute or more. Changes to `devcontainer.json` apply
+only after `claudebox --rebuild`. The volume keeps its contents through a
+rebuild.
+
+## When the container stops
+
+When the last `claudebox` session in a project's container ends, claudebox
+stops the container. That includes sessions from `--shell`, and closing the
+terminal counts as ending a session. Stopping is not removing: anything
+installed in the container is still there next time.
+
+- The next `claudebox` starts the container again in a few seconds. The
+  project's `postStartCommand` runs again, so with the example's firewall it
+  takes longer.
+- While one session is open, others can come and go. Each one holds a shared
+  lock (`flock`, from util-linux), and only the last to end stops the
+  container. Without `flock`, the container keeps running.
+- `claudebox --keep-running` leaves it running when that session ends, for
+  example when Claude started a server you want to keep. The next session that
+  ends without the flag, as the last one, stops it.
+- Processes left running in the container stop with it.
 
 ## Cleanup
 

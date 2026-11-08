@@ -30,6 +30,8 @@ Options:
   --share-history       share chat history with Claude on the host; this
                         project keeps sharing until --no-share-history
   --no-share-history    stop sharing chat history for this project
+  --keep-running        leave the container running when this session ends
+                        (by default the last session to end stops it)
   -h, --help            show this help
 
 Arguments after the options (or after --) are passed to claude.
@@ -61,10 +63,11 @@ case ${CLAUDEBOX_SHARE_HISTORY:-no} in
   *) die "CLAUDEBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
 esac
 
-rebuild=false shell=false remove=false config= share_flag=
+rebuild=false shell=false remove=false keep=false config= share_flag=
 while (($#)); do
   case $1 in
     --rebuild) rebuild=true ;;
+    --keep-running) keep=true ;;
     --shell) shell=true ;;
     --rm) remove=true ;;
     --share-history) share_flag=true ;;
@@ -133,6 +136,16 @@ if $remove; then
   exit 0
 fi
 
+# Every session in this project's container holds a shared lock while it runs,
+# so the last one to end can stop the container. It's taken before the
+# container starts, so a session that is just starting can't be cut off.
+# Without flock, the container keeps running.
+key=$(printf '%s' "$root|$config" | cksum | cut -d' ' -f1)
+exec {lock_fd}>"${XDG_RUNTIME_DIR:-/tmp}/claudebox-$UID-$key.lock"
+have_flock=false
+command -v flock >/dev/null && have_flock=true
+$have_flock && flock -s "$lock_fd"
+
 existing=$(docker ps -aq --filter "label=claudebox.folder=$root" --filter "label=claudebox.config=$config" | head -n1)
 
 # Sharing history takes mounts, which are fixed when a container is created.
@@ -171,6 +184,8 @@ $rebuild && up+=(--remove-existing-container)
 # Building shows useful progress on stderr; starting an existing container
 # only prints a version banner, so keep that quiet unless it fails.
 if [[ -n $existing ]] && ! $rebuild; then
+  [[ $(docker inspect -f '{{.State.Running}}' "$existing") == true ]] ||
+    echo "claudebox: starting the dev container" >&2
   log=$(mktemp)
   result=$("${up[@]}" </dev/null 2>"$log") || { cat "$log" >&2; rm -f "$log"; up_failed "$result"; }
   rm -f "$log"
@@ -218,5 +233,24 @@ env_args=(--remote-env "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 [[ -n ${TERM-} ]] && env_args+=(--remote-env "TERM=$TERM")
 [[ -n ${COLORTERM-} ]] && env_args+=(--remote-env "COLORTERM=$COLORTERM")
 
-exec devcontainer exec --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}" "${env_args[@]}" \
-  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$workdir" "${cmd[@]}"
+# Run the session, not exec it, so the container can be stopped afterwards. The
+# HUP trap lets a closed terminal get there too; the session itself still gets
+# the signal.
+trap : HUP
+status=0
+devcontainer exec --workspace-folder "$root" "${cfg_args[@]}" "${ids[@]}" "${env_args[@]}" \
+  sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' sh "$workdir" "${cmd[@]}" {lock_fd}>&- || status=$?
+
+# Stop the container if no other session holds the lock. The stop runs in the
+# background with the lock still open, so the prompt comes back at once and a
+# new session waits until the container is down before starting it again.
+# After a closed terminal, this script's exit sends a hangup to the stop, so it
+# inherits HUP ignored (nohup would leave a moment where it can still be killed).
+if $have_flock && ! $keep; then
+  flock -u "$lock_fd"
+  if flock -xn "$lock_fd"; then
+    trap '' HUP
+    docker stop "$cid" >/dev/null 2>&1 &
+  fi
+fi
+exit "$status"
