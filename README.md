@@ -191,6 +191,10 @@ commands on your host.
    - `--no-lockfile`, so the CLI doesn't write agentbox's features into the
      project's `devcontainer-lock.json`. As a result, a lockfile the project
      has is not checked either.
+   - `safe.directory=*` for git, set through `GIT_CONFIG_*` variables. The
+     project keeps its host owner in the container, so with any other
+     container user, such as `root`, git would otherwise stop with "dubious
+     ownership", already in the project's `postCreateCommand`.
 3. **Gives the volumes to the container's user**, because Docker creates them
    owned by root.
 4. **Runs the agent with `devcontainer exec`**, in the same subfolder you are
