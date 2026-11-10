@@ -60,6 +60,7 @@ Options (before AGENT; arguments after it go to the agent):
                         a plain container where there is no .devcontainer, and
                         whether to recreate a container (which ends the
                         sessions in it)
+  --version             show agentbox's version
   -h, --help            show this help
 
 Config file $CONF (plain shell):
@@ -97,6 +98,12 @@ while (($#)); do
       [[ $# -ge 2 && -f $2 ]] || die "--config needs an existing file"
       config=$(readlink -f -- "$2"); shift ;;
     -h|--help) usage; exit 0 ;;
+    # install.sh writes VERSION; a clone has git instead.
+    --version)
+      cat -- "$AGENTBOX_HOME/VERSION" 2>/dev/null ||
+        git -C "$AGENTBOX_HOME" describe --tags --always --dirty 2>/dev/null ||
+        echo unknown
+      exit 0 ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -155,8 +162,12 @@ else
 fi
 
 # Our own id labels keep agentbox's container apart from one VS Code made for
-# the same folder, which would not have the agents installed.
-ids=(--id-label "agentbox.folder=$root" --id-label "agentbox.config=$config")
+# the same folder, which would not have the agents installed. The plain
+# container is labelled "default" rather than by its file's path, so it's still
+# found after agentbox is installed somewhere else.
+config_label=$config
+$plain && config_label=default
+ids=(--id-label "agentbox.folder=$root" --id-label "agentbox.config=$config_label")
 
 if $remove; then
   containers=$(docker ps -aq --filter "label=agentbox.folder=$root")
@@ -174,13 +185,13 @@ fi
 # so the last one to end can stop the container. It's taken before the
 # container starts, so a session that is just starting can't be cut off.
 # Without flock, the container keeps running.
-key=$(printf '%s' "$root|$config" | cksum | cut -d' ' -f1)
+key=$(printf '%s' "$root|$config_label" | cksum | cut -d' ' -f1)
 exec {lock_fd}>"${XDG_RUNTIME_DIR:-/tmp}/agentbox-$UID-$key.lock"
 have_flock=false
 command -v flock >/dev/null && have_flock=true
 $have_flock && flock -s "$lock_fd"
 
-existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=agentbox.config=$config" | head -n1)
+existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=agentbox.config=$config_label" | head -n1)
 
 # The container's mounts tell what it was created with, and mounts are fixed
 # at creation: each agent's config volume is at /<agent>-config, and with

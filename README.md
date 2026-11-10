@@ -26,6 +26,27 @@ agentbox --shell      # a shell in the same container
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/kgonia/agentbox/main/install.sh | bash
+```
+
+This puts the latest release in `~/.local/share/agentbox` and the `agentbox`
+and `claudebox` commands in `~/.local/bin`. Running it again updates
+agentbox. `agentbox --version` shows which release you have.
+
+- To read the script before running it:
+  `curl -fsSLO https://raw.githubusercontent.com/kgonia/agentbox/main/install.sh`,
+  then `less install.sh` and `bash install.sh`.
+- `curl ... | AGENTBOX_VERSION=v0.1.0 bash` installs a particular release, and
+  `AGENTBOX_VERSION=main` the development version. `AGENTBOX_BIN_DIR` puts the
+  commands somewhere else.
+- To uninstall: `rm -rf ~/.local/share/agentbox ~/.local/bin/agentbox ~/.local/bin/claudebox`.
+  The containers and volumes stay until you remove them (see Cleanup).
+
+To work on agentbox, link the commands from a clone instead. The installer
+leaves such links alone.
+
+```sh
+git clone https://github.com/kgonia/agentbox.git && cd agentbox
 ln -s "$PWD/bin/agentbox" ~/.local/bin/agentbox
 ln -s "$PWD/bin/claudebox" ~/.local/bin/claudebox   # optional
 ```
@@ -47,6 +68,7 @@ agentbox [options] --shell [AGENT]
   --keep-running        leave the container running when this session ends
                         (by default the last session to end stops it)
   -y, --yes             answer yes to agentbox's questions
+  --version             show agentbox's version
   -h, --help            show this help
 ```
 
@@ -269,3 +291,7 @@ volume is the same, so its login carries over.
 `example/` is a minimal project for trying it out: `cd example && agentbox claude`.
 It has a plain definition and a firewalled variant for Claude, which is the one
 agentbox uses.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
