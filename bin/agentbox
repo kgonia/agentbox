@@ -286,6 +286,14 @@ for a in "${agents[@]}"; do
   fi
   owned+=("$dir|$skip")
 done
+
+# The project is bind-mounted with the host's owner, so for any other container
+# user (often root) git stops with "dubious ownership", already in the
+# project's postCreateCommand. VS Code works around this too; here it is git's
+# config from the environment, which leaves the image's gitconfig alone and
+# covers the lifecycle commands as well as the agent.
+env_args+=(--remote-env GIT_CONFIG_COUNT=1
+  --remote-env GIT_CONFIG_KEY_0=safe.directory --remote-env "GIT_CONFIG_VALUE_0=*")
 if $SHARE; then
   # History is filed under the project's path, so the project also has to be at
   # its host path in the container: its git root, so git still works.
