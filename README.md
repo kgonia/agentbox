@@ -93,7 +93,7 @@ Options go before the agent's name. Everything after it goes to the agent:
 | `claude` | Claude Code's dev container feature, with Node, when the container is built | `CLAUDE_CONFIG_DIR` = `/claude-config` | Pick the subscription login, open the URL it prints on your host, paste the code back | Yes |
 | `codex` | OpenAI's installer, into the volume, on first run | `CODEX_HOME` = `/codex-config` | `agentbox codex login --device-auth` (turn on device code login in ChatGPT's security settings first), or `printenv OPENAI_API_KEY \| agentbox codex login --with-api-key` | No |
 | `hermes` | Nous Research's installer, into the volume, on first run (a few minutes, about 2.5 GB) | `HERMES_HOME` = `/hermes-config` | `agentbox hermes setup` or `agentbox hermes model`: providers log in with a device code or an API key | No |
-| `antigravity` | Google's installer, into the volume, on first run | `~/.gemini`, linked to `/antigravity-config/gemini` | On the first prompt, open the URL it prints on your host, sign in with Google, paste the code back (quickly: the prompt closes after about 30 seconds) | No |
+| `antigravity` (or `agy`) | Google's installer, into the volume, on first run | `~/.gemini`, linked to `/antigravity-config/gemini` | On the first prompt, open the URL it prints on your host, sign in with Google, paste the code back (quickly: the prompt closes after about 30 seconds) | No |
 
 Each agent's config folder is a Docker volume named `<agent>-config`, shared
 by every project. It holds the agent's login, settings and history, and for
@@ -306,7 +306,10 @@ commands on your host.
      container has.
    - its own id labels (`agentbox.folder`, `agentbox.config`), so it never
      reuses a container VS Code created for the same folder. That container
-     would not have the agents.
+     would not have the agents. The definition is part of the id, so when it
+     changes, for example when a project that ran in the plain container gets
+     a `.devcontainer`, agentbox makes a new container and names the old one,
+     to remove with `docker rm` (`--rm` would remove both).
    - `--no-lockfile`, so the CLI doesn't write agentbox's features into the
      project's `devcontainer-lock.json`. As a result, a lockfile the project
      has is not checked either.

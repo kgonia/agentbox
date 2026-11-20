@@ -33,6 +33,29 @@ known_agents() {
   for f in "$AGENTBOX_HOME"/agents/*.sh; do basename -- "$f" .sh; done | paste -sd' ' -
 }
 
+# Other names an agent goes by: the command, where it differs from the profile.
+declare -A ALIASES=([agy]=antigravity)
+
+# The agent name (or other name) closest to a mistyped one, at most two
+# letters off, for "did you mean".
+closest_agent() {
+  { known_agents | tr ' ' '\n'; printf '%s\n' "${!ALIASES[@]}"; } | awk -v typed="$1" '
+    function distance(a, b,   i, j, d, c) {
+      for (i = 0; i <= length(a); i++) d[i, 0] = i
+      for (j = 0; j <= length(b); j++) d[0, j] = j
+      for (i = 1; i <= length(a); i++)
+        for (j = 1; j <= length(b); j++) {
+          c = d[i - 1, j - 1] + (substr(a, i, 1) != substr(b, j, 1))
+          if (d[i - 1, j] + 1 < c) c = d[i - 1, j] + 1
+          if (d[i, j - 1] + 1 < c) c = d[i, j - 1] + 1
+          d[i, j] = c
+        }
+      return d[length(a), length(b)]
+    }
+    { n = distance(typed, $0); if (n <= 2 && (best == "" || n < min)) { best = $0; min = n } }
+    END { if (best != "") print best }'
+}
+
 usage() {
   cat <<EOF
 Usage: agentbox [options] AGENT [agent args...]
@@ -44,7 +67,7 @@ Runs AGENT ($(known_agents)) in the dev container defined by the nearest
 and .devcontainer.json. Without any of them, agentbox offers a plain Ubuntu
 container with Python, uv and Node. Each project has one container, shared by
 every agent run in it.
-Invoked as claudebox, AGENT is claude.
+Invoked as claudebox, AGENT is claude. agy is another name for antigravity.
 
 Options (before AGENT; arguments after it go to the agent):
   --rebuild             recreate the container from its definition, then continue
@@ -132,8 +155,26 @@ elif (($#)); then
 elif ! $shell && ! $remove && ! $installed; then
   usage >&2; exit 2
 fi
-[[ -z $agent || -f $AGENTBOX_HOME/agents/$agent.sh ]] ||
-  die "no agent called '$agent' (there are: $(known_agents))"
+if [[ -n $agent ]] && [[ -n ${ALIASES[$agent]-} ]]; then agent=${ALIASES[$agent]}; fi
+if [[ -n $agent && ! -f $AGENTBOX_HOME/agents/$agent.sh ]]; then
+  guess=$(closest_agent "$agent")
+  die "no agent called '$agent'${guess:+; did you mean $guess?} (there are: $(known_agents))"
+fi
+
+# Everything after the agent is its own, so agentbox's options there reach the
+# agent instead, which then mostly stops on a flag it doesn't know. Only options
+# no agent has are caught; --config, --yes and --help could be the agent's.
+misplaced=()
+for a; do
+  case $a in
+    --rebuild|--shell|--rm|--installed|--no-deps|--share-history|--no-share-history|--ssh-agent|--keep-running)
+      misplaced+=("$a") ;;
+  esac
+done
+if ((${#misplaced[@]})); then
+  if [[ $(basename -- "$0") == claudebox ]]; then fix="claudebox ${misplaced[*]}"; else fix="agentbox ${misplaced[*]} $agent"; fi
+  echo "agentbox: ${misplaced[*]} after the agent goes to $agent, not to agentbox; agentbox's own options go first: $fix" >&2
+fi
 
 command -v docker >/dev/null || die "docker not found"
 command -v devcontainer >/dev/null ||
@@ -319,6 +360,17 @@ if [[ -n $existing ]]; then
   existing_share=false
   grep -qE '^/[a-z0-9_-]+-config/.' <<<"$current" && existing_share=true
   existing_ssh=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ssh-agent"}}{{.Source}}{{end}}{{end}}' "$existing")
+fi
+
+# A container is found by its definition too, so after the definition changes
+# (the project gets a .devcontainer, say) a new one is made and the old one is
+# left behind. Name it, since --rm would remove the new one as well.
+if [[ -z $existing ]]; then
+  while read -r name label; do
+    [[ -n $name && $label != "$config_label" ]] || continue
+    [[ $label == default ]] && label="the plain definition"
+    echo "agentbox: this folder's old container $name, made from $label, is no longer used; remove it with: docker rm $name" >&2
+  done < <(docker ps -a --filter "label=agentbox.folder=$root" --format '{{.Names}} {{.Label "agentbox.config"}}')
 fi
 
 if $plain && [[ -z $existing ]]; then
