@@ -1,6 +1,6 @@
 # agentbox
 
-Runs a coding agent (Claude Code, Codex or Hermes Agent) inside a project's own
+Runs a coding agent (Claude Code, Codex, Hermes Agent or the Antigravity CLI) inside a project's own
 dev container, without editing the project. It works with any `.devcontainer`,
 including a team one that knows nothing about agents.
 
@@ -10,6 +10,7 @@ agentbox claude       # build or start the container, run Claude Code in it
 agentbox claude -c    # arguments after the agent go to it (here: continue)
 agentbox codex        # Codex, in the same container
 agentbox hermes       # Hermes Agent, in the same container
+agentbox antigravity  # Google's Antigravity CLI (agy), in the same container
 agentbox --shell      # a shell in the same container
 ```
 
@@ -85,11 +86,12 @@ Options go before the agent's name. Everything after it goes to the agent:
 | `claude` | Claude Code's dev container feature, with Node, when the container is built | `CLAUDE_CONFIG_DIR` = `/claude-config` | Pick the subscription login, open the URL it prints on your host, paste the code back | Yes |
 | `codex` | OpenAI's installer, into the volume, on first run | `CODEX_HOME` = `/codex-config` | `agentbox codex login --device-auth` (turn on device code login in ChatGPT's security settings first), or `printenv OPENAI_API_KEY \| agentbox codex login --with-api-key` | No |
 | `hermes` | Nous Research's installer, into the volume, on first run (a few minutes, about 2.5 GB) | `HERMES_HOME` = `/hermes-config` | `agentbox hermes setup` or `agentbox hermes model`: providers log in with a device code or an API key | No |
+| `antigravity` | Google's installer, into the volume, on first run | `~/.gemini`, linked to `/antigravity-config/gemini` | On the first prompt, open the URL it prints on your host, sign in with Google, paste the code back (quickly: the prompt closes after about 30 seconds) | No |
 
 Each agent's config folder is a Docker volume named `<agent>-config`, shared
 by every project. It holds the agent's login, settings and history, and for
-Codex and Hermes the agent itself, so `codex update` and `hermes update` work
-and last. Log in once per agent.
+Codex, Hermes and Antigravity the agent itself, so `codex update`,
+`hermes update` and `agy update` work and last. Log in once per agent.
 
 - **Codex** runs with `--sandbox danger-full-access` unless you pass a sandbox
   flag yourself. Its own sandbox (bubblewrap) can't create namespaces in a
@@ -101,13 +103,21 @@ and last. Log in once per agent.
   use, which drives a desktop. `hermes chat` starts a background gateway that
   would finish a turn after you leave, but it stops with the container: use
   `--keep-running` for that.
+- **Antigravity** has no variable for its config folder and always uses
+  `~/.gemini`, so agentbox links that to the volume each time it starts agy.
+  If the image already has a real `~/.gemini` folder, agentbox leaves it
+  alone and says so: agy then works, but its login doesn't outlast the
+  container. The volume also keeps the Gemini CLI's settings, which use the
+  same folder. agy asks before running commands; `--dangerously-skip-permissions`
+  turns that off.
 - **Claude** stays at the version installed when the container's image was
   first built. Its own auto-update fails in the container, and `--rebuild`
   doesn't help, because Docker reuses the cached feature layer.
 
 Codex and Hermes keep their sessions in SQLite databases, which shouldn't be
-shared between the host and a container, so `--share-history` covers only
-Claude for now.
+shared between the host and a container, and Antigravity doesn't file its
+conversations by project path, so `--share-history` covers only Claude for
+now.
 
 ## One container for all agents
 
@@ -331,7 +341,7 @@ volume is the same, so its login carries over.
   paths are one folder deeper. `example/.devcontainer/agentbox/devcontainer.json`
   is a working example for Claude. It runs the `init-firewall.sh` that the
   Claude Code feature installs, which lets through only what Claude needs, so
-  Codex and Hermes can't reach their services from behind it. Version 1.0.5
+  Codex, Hermes and Antigravity can't reach their services from behind it. Version 1.0.5
   of that script stops when a domain on its list no longer resolves
   (`statsig.anthropic.com` doesn't), so the example patches that while running
   it. If the start command fails, run `agentbox --rebuild ...` after fixing
