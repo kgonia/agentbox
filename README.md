@@ -61,6 +61,9 @@ agentbox [options] --shell [AGENT]
   --rebuild             recreate the container from its definition, then continue
   --shell               open a shell in the container instead of an agent
   --rm                  remove this project's agentbox containers and exit
+  --installed           list the apt packages installed in this project's
+                        container since it was made, which a rebuild would
+                        drop, and exit
   --config FILE         use FILE as devcontainer.json
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
@@ -137,6 +140,23 @@ in it. Go ahead? [y/N]
 `--rebuild` asks only when other sessions are using the container. `--yes`
 answers yes to all of these. Without a terminal to ask on, agentbox stops
 rather than guess.
+
+To keep what you or an agent installed, put it in `devcontainer.json` (a
+feature, `postCreateCommand` or the Dockerfile) before the container is
+recreated. `agentbox --installed` lists the apt packages to move there:
+
+```
+$ agentbox --installed
+cowsay
+agentbox: to keep these through a rebuild, install them from devcontainer.json, for example:
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cowsay"
+```
+
+It compares the container's dpkg database with its image's, so it also works
+while the container is stopped. It lists only the packages installed on
+purpose, not the dependencies apt pulled in, and includes those the
+definition's own start commands installed. Only apt is covered (Debian and
+Ubuntu images), not `pip`, `npm -g` or files put in place by hand.
 
 ## Settings
 
