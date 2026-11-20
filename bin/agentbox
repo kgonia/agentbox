@@ -42,7 +42,8 @@ Runs AGENT ($(known_agents)) in the dev container defined by the nearest
 .devcontainer, searching up from the current directory:
 .devcontainer/agentbox/devcontainer.json first, then .devcontainer/devcontainer.json
 and .devcontainer.json. Without any of them, agentbox offers a plain Ubuntu
-container. Each project has one container, shared by every agent run in it.
+container with Python, uv and Node. Each project has one container, shared by
+every agent run in it.
 Invoked as claudebox, AGENT is claude.
 
 Options (before AGENT; arguments after it go to the agent):
@@ -54,6 +55,9 @@ Options (before AGENT; arguments after it go to the agent):
                         packages, then files added in home folders, /usr/local
                         and /opt (by pip, npm -g, uv, nvm or by hand); and exit
   --config FILE         use FILE as devcontainer.json
+  --no-deps             make the plain container bare Ubuntu, without Python,
+                        uv and Node; it counts when the container is made, and
+                        recreates one that has them, after asking
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
                         until --no-share-history
@@ -91,10 +95,11 @@ case ${AGENTBOX_SHARE_HISTORY:-no} in
   *) die "AGENTBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
 esac
 
-rebuild=false shell=false remove=false installed=false keep=false yes=false config= share_flag= ssh=false
+rebuild=false shell=false remove=false installed=false keep=false yes=false config= share_flag= ssh=false deps=true
 while (($#)); do
   case $1 in
     --rebuild) rebuild=true ;;
+    --no-deps) deps=false ;;
     -y|--yes) yes=true ;;
     --shell) shell=true ;;
     --rm) remove=true ;;
@@ -163,12 +168,17 @@ else
     root=$dir
     cfg_args=(--config "$config")
   else
+    # With Python, uv and Node, so that an agent doesn't install them by hand
+    # where a rebuild would drop them; bare with --no-deps.
     root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "$here")
     config=$AGENTBOX_HOME/default/devcontainer.json
+    $deps || config=$AGENTBOX_HOME/default/bare/devcontainer.json
     cfg_args=(--override-config "$config")
     plain=true
   fi
 fi
+$deps || $plain ||
+  echo "agentbox: --no-deps changes only the plain container; this project has its own definition, $config" >&2
 
 # Our own id labels keep agentbox's container apart from one VS Code made for
 # the same folder, which would not have the agents installed. The plain
@@ -290,8 +300,13 @@ existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=
 # The container's mounts tell what it was created with, and mounts are fixed
 # at creation: each agent's config volume is at /<agent>-config, and with
 # shared history, a host folder is mounted inside one of them.
-agents=() existing_share= existing_ssh= other_volumes=false
+agents=() existing_share= existing_ssh= other_volumes=false existing_deps=false
 if [[ -n $existing ]]; then
+  # The features a container was built with are in its metadata label; for the
+  # plain container, Python's tells whether it has the deps.
+  if $plain && [[ $(docker inspect -f '{{index .Config.Labels "devcontainer.metadata"}}' "$existing") == *'"id":"ghcr.io/devcontainers/features/python:'* ]]; then
+    existing_deps=true
+  fi
   current=$(docker inspect -f '{{range .Mounts}}{{println .Destination .Name}}{{end}}' "$existing")
   while read -r d name; do
     [[ $d =~ ^/([a-z0-9_-]+)-config$ ]] || continue
@@ -307,7 +322,9 @@ if [[ -n $existing ]]; then
 fi
 
 if $plain && [[ -z $existing ]]; then
-  confirm "There's no .devcontainer here or in any folder above. Start a plain Ubuntu container for $root?" ||
+  what="a plain Ubuntu container with Python, uv and Node"
+  $deps || what="a bare Ubuntu container"
+  confirm "There's no .devcontainer here or in any folder above. Start $what for $root?" ||
     die "nothing started"
 fi
 
@@ -357,6 +374,9 @@ if [[ -n $existing ]]; then
     # containers made before forwarding existed, or with another runtime dir
     $ssh && [[ $existing_ssh != "$ssh_dir" ]] && why+=", so that it can use the SSH agent"
     $other_volumes && why+=", to use the volumes named ${PREFIX}<agent>-config"
+    # Only --no-deps asks for a change: without it, a bare container stays bare
+    # until it's recreated for another reason.
+    ! $deps && $existing_deps && why+=", to leave out Python, uv and Node"
   fi
   if [[ -n $why ]] || $rebuild; then
     ends=

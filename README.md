@@ -66,6 +66,9 @@ agentbox [options] --shell [AGENT]
                         packages, then files added in home folders, /usr/local
                         and /opt (by pip, npm -g, uv, nvm or by hand); and exit
   --config FILE         use FILE as devcontainer.json
+  --no-deps             make the plain container bare Ubuntu, without Python,
+                        uv and Node; it counts when the container is made, and
+                        recreates one that has them, after asking
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
                         until --no-share-history
@@ -122,6 +125,25 @@ Codex and Hermes keep their sessions in SQLite databases, which shouldn't be
 shared between the host and a container, and Antigravity doesn't file its
 conversations by project path, so `--share-history` covers only Claude for
 now.
+
+## Without a .devcontainer
+
+Where a project has no `.devcontainer`, agentbox offers a plain container of
+its own, `default/devcontainer.json`: Ubuntu with Python (the system's
+`python3`), uv, and Node LTS with npm and pnpm, from the dev container
+features. Most projects need one or the other, and an agent that installs
+them by hand puts them where a rebuild drops them. Other Python versions come
+from uv (`uv python install`, or the project's `.python-version`). The first
+build takes about a minute longer than bare Ubuntu, and the image is about
+0.9 GB larger (2.1 GB instead of 1.2 GB).
+
+`--no-deps` makes it bare Ubuntu, `default/bare/devcontainer.json`. It counts
+when the container is made:
+
+- With `--no-deps`, a container that has Python and Node is recreated without
+  them, after asking.
+- Without it, an existing container stays as it is, bare or not. One that is
+  made or recreated later, by `--rebuild` or to add an agent, gets them.
 
 ## One container for all agents
 
@@ -273,8 +295,9 @@ commands on your host.
 1. **Finds the definition.** Starting in the current folder and walking up,
    it takes the first of `.devcontainer/agentbox/devcontainer.json`,
    `.devcontainer/devcontainer.json` or `.devcontainer.json`. With none, it
-   offers `default/devcontainer.json` (plain Ubuntu) for the git root, or the
-   current folder outside git.
+   offers `default/devcontainer.json` (Ubuntu with Python, uv and Node), or
+   with `--no-deps` `default/bare/devcontainer.json` (bare Ubuntu), for the git
+   root, or the current folder outside git.
 2. **Runs `devcontainer up` with additions** that leave the project untouched:
    - the features of the container's agents (`--additional-features`).
      Options the project sets for the same features take precedence.
