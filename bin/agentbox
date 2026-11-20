@@ -54,6 +54,9 @@ Options (before AGENT; arguments after it go to the agent):
                         whose profile supports it); this project keeps sharing
                         until --no-share-history
   --no-share-history    stop sharing chat history for this project
+  --ssh-agent           let this session use the host's SSH agent (the keys
+                        in it), for example for git over SSH; only while it
+                        runs, and only when given
   --keep-running        leave the container running when this session ends
                         (by default the last session to end stops it)
   -y, --yes             answer yes to agentbox's questions: whether to start
@@ -84,7 +87,7 @@ case ${AGENTBOX_SHARE_HISTORY:-no} in
   *) die "AGENTBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
 esac
 
-rebuild=false shell=false remove=false keep=false yes=false config= share_flag=
+rebuild=false shell=false remove=false keep=false yes=false config= share_flag= ssh=false
 while (($#)); do
   case $1 in
     --rebuild) rebuild=true ;;
@@ -94,6 +97,7 @@ while (($#)); do
     --keep-running) keep=true ;;
     --share-history) share_flag=true ;;
     --no-share-history) share_flag=false ;;
+    --ssh-agent) ssh=true ;;
     --config)
       [[ $# -ge 2 && -f $2 ]] || die "--config needs an existing file"
       config=$(readlink -f -- "$2"); shift ;;
@@ -196,7 +200,7 @@ existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=
 # The container's mounts tell what it was created with, and mounts are fixed
 # at creation: each agent's config volume is at /<agent>-config, and with
 # shared history, a host folder is mounted inside one of them.
-agents=() existing_share= other_volumes=false
+agents=() existing_share= existing_ssh= other_volumes=false
 if [[ -n $existing ]]; then
   current=$(docker inspect -f '{{range .Mounts}}{{println .Destination .Name}}{{end}}' "$existing")
   while read -r d name; do
@@ -209,6 +213,7 @@ if [[ -n $existing ]]; then
   done <<<"$current"
   existing_share=false
   grep -qE '^/[a-z0-9_-]+-config/.' <<<"$current" && existing_share=true
+  existing_ssh=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ssh-agent"}}{{.Source}}{{end}}{{end}}' "$existing")
 fi
 
 if $plain && [[ -z $existing ]]; then
@@ -234,6 +239,22 @@ SHARE=${share_flag:-${existing_share:-$default_share}}
 missing=false
 [[ -n $agent && " ${agents[*]} " != *" $agent "* ]] && missing=true
 
+# The SSH agent is forwarded per session, but mounts are fixed when the
+# container is made. So every container gets an empty folder of agentbox's at
+# /ssh-agent, and a session with --ssh-agent puts a hard link to the agent's
+# socket in it while it runs, which works where a symlink to a host path
+# wouldn't. Sockets that are links of sessions that died are removed.
+ssh_dir=${XDG_RUNTIME_DIR:-/tmp}/agentbox-$UID-$key.ssh
+mkdir -p -m 700 -- "$ssh_dir"
+for f in "$ssh_dir"/*; do
+  [[ -e $f || -L $f ]] || continue
+  kill -0 "${f##*/}" 2>/dev/null || rm -f -- "$f"
+done
+if $ssh; then
+  [[ -n ${SSH_AUTH_SOCK-} && -S $SSH_AUTH_SOCK ]] ||
+    die "no SSH agent to forward: SSH_AUTH_SOCK isn't set to a socket"
+fi
+
 # Recreating the container ends every session in it and drops whatever was
 # installed in it outside the volumes. So ask first: always when the container
 # has to be recreated for a flag or a new agent, and on --rebuild when other
@@ -243,6 +264,8 @@ if [[ -n $existing ]]; then
   if ! $rebuild; then
     [[ $SHARE != "$existing_share" ]] && why+=", to turn history sharing $($SHARE && echo on || echo off)"
     $missing && why+=", to add $agent"
+    # containers made before forwarding existed, or with another runtime dir
+    $ssh && [[ $existing_ssh != "$ssh_dir" ]] && why+=", so that it can use the SSH agent"
     $other_volumes && why+=", to use the volumes named ${PREFIX}<agent>-config"
   fi
   if [[ -n $why ]] || $rebuild; then
@@ -294,6 +317,7 @@ done
 # covers the lifecycle commands as well as the agent.
 env_args+=(--remote-env GIT_CONFIG_COUNT=1
   --remote-env GIT_CONFIG_KEY_0=safe.directory --remote-env "GIT_CONFIG_VALUE_0=*")
+mounts+=(--mount "type=bind,source=$ssh_dir,target=/ssh-agent")
 if $SHARE; then
   # History is filed under the project's path, so the project also has to be at
   # its host path in the container: its git root, so git still works.
@@ -352,6 +376,20 @@ if $shell; then
 else
   load "$agent"
   cmd=(sh -c "$AGENT_RUN" "$agent" "$@")
+fi
+
+if $ssh; then
+  # Named after this script's PID, so a later run can tell it's stale.
+  ssh_link=$ssh_dir/$$
+  ln -f -- "$(readlink -f -- "$SSH_AUTH_SOCK")" "$ssh_link" 2>/dev/null ||
+    die "can't forward the SSH agent: its socket $SSH_AUTH_SOCK must be on the same filesystem as $ssh_dir"
+  trap 'rm -f -- "$ssh_link"' EXIT
+  # The container has no known_hosts, and an agent can't answer ssh's question
+  # about a new host key, so git takes the key on first use, as a "yes" would.
+  env_args=("${env_args[@]/GIT_CONFIG_COUNT=1/GIT_CONFIG_COUNT=2}"
+    --remote-env "SSH_AUTH_SOCK=/ssh-agent/$$"
+    --remote-env GIT_CONFIG_KEY_1=core.sshCommand
+    --remote-env "GIT_CONFIG_VALUE_1=ssh -o StrictHostKeyChecking=accept-new")
 fi
 
 # The CLI sets TERM=xterm otherwise; pass the host's so colors match.
