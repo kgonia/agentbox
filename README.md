@@ -65,6 +65,9 @@ agentbox [options] --shell [AGENT]
                         whose profile supports it); this project keeps sharing
                         until --no-share-history
   --no-share-history    stop sharing chat history for this project
+  --ssh-agent           let this session use the host's SSH agent (the keys
+                        in it), for example for git over SSH; only while it
+                        runs, and only when given
   --keep-running        leave the container running when this session ends
                         (by default the last session to end stops it)
   -y, --yes             answer yes to agentbox's questions
@@ -136,6 +139,53 @@ AGENTBOX_VOLUME_PREFIX=work-    # volumes named work-claude-config and so on (de
 
 `AGENTBOX_VOLUME_PREFIX` can also be set in the environment, which overrides
 the file. History sharing can't: it's controlled by the flags and the file.
+
+## Forwarding the SSH agent
+
+By default the container has no access to your SSH keys, so git over SSH
+(`git fetch`, `git push` to `git@github.com:...`) doesn't work in it. IDEs such
+as VS Code and IntelliJ forward the host's SSH agent into their dev containers;
+the Dev Containers CLI doesn't, and agentbox does it only for a session that
+asks:
+
+```sh
+agentbox --ssh-agent claude   # this session can use your SSH agent
+agentbox claude               # this one can't
+```
+
+**This gives the agent your keys for as long as the session runs.** The keys
+stay on the host, but the agent can use them, so it can push to, or delete
+branches in, every repository your keys reach, whether by mistake or because
+something it read told it to. Where that's too much, give the container a
+narrower credential instead, such as a deploy key or a fine-grained token for
+one repository, or let the agent commit and do the fetching and pushing
+yourself on the host.
+
+How it works:
+
+- Every container gets a folder of agentbox's mounted at `/ssh-agent`,
+  `$XDG_RUNTIME_DIR/agentbox-<uid>-<id>.ssh` on the host, which is empty
+  while no session forwards the agent. A mount can't be added to a running
+  container, so this is what lets forwarding be per session.
+- A session with `--ssh-agent` puts a hard link to the socket that
+  `SSH_AUTH_SOCK` points at in that folder, named after the session, and
+  points `SSH_AUTH_SOCK` in the container at it. The link is removed when the
+  session ends, or by the next run if the session died. A hard link works
+  where a symlink to a host path wouldn't, but it needs the socket on the
+  same filesystem as that folder, as it is for agents that keep their socket
+  under `/run/user/<uid>` (GNOME Keyring, systemd's `ssh-agent`).
+- The session also sets git's `core.sshCommand` to
+  `ssh -o StrictHostKeyChecking=accept-new`, as `GIT_CONFIG_*` variables. The
+  container has no `known_hosts`, and an agent can't answer ssh's question
+  about a new host, so git takes a host's key the first time, as answering
+  "yes" would.
+
+Other sessions in the same container don't get `SSH_AUTH_SOCK`, but while a
+session with `--ssh-agent` runs, they could still find its socket in
+`/ssh-agent`. A container made before agentbox had this folder is recreated
+once, after asking, the first time a session asks for the agent. The folder
+is open only to you, so the container's user needs your UID, as it has by
+default (see Caveats), or to be root.
 
 ## Sharing history with the host
 
