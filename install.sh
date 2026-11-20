@@ -69,14 +69,14 @@ main() {
 
   # Commands that lead somewhere else, such as links to a clone, stay as they are.
   mkdir -p -- "$bin_dir"
-  local name link target ours
+  local name link target ours kept=()
   ours=$(readlink -f -- "$dest/bin/agentbox")
   for name in agentbox claudebox; do
     link=$bin_dir/$name
     if [[ -e $link || -L $link ]]; then
       target=$(readlink -f -- "$link" || true)
       if [[ $target != "$ours" ]]; then
-        echo "agentbox: left $link alone, it leads to ${target:-nowhere}"
+        kept+=("$name|$link|${target:-nowhere}")
         continue
       fi
     fi
@@ -84,6 +84,15 @@ main() {
   done
 
   echo "agentbox: installed $version in $dest"
+  # Easy to miss otherwise: the commands still run the other copy.
+  if ((${#kept[@]})); then
+    local k
+    for k in "${kept[@]}"; do
+      IFS='|' read -r name link target <<<"$k"
+      echo "agentbox: but $link still runs $target, not $version; to switch:" >&2
+      echo "  ln -sfn \"$dest/bin/$name\" \"$link\"" >&2
+    done
+  fi
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) echo "agentbox: add $bin_dir to your PATH to run it" ;;

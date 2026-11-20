@@ -43,7 +43,8 @@ agentbox. `agentbox --version` shows which release you have.
   The containers and volumes stay until you remove them (see Cleanup).
 
 To work on agentbox, link the commands from a clone instead. The installer
-leaves such links alone.
+leaves such links alone, so the commands keep running the clone; it says so,
+with the `ln -sfn` command that switches them to the installed copy.
 
 ```sh
 git clone https://github.com/kgonia/agentbox.git && cd agentbox
