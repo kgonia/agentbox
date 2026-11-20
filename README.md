@@ -61,9 +61,10 @@ agentbox [options] --shell [AGENT]
   --rebuild             recreate the container from its definition, then continue
   --shell               open a shell in the container instead of an agent
   --rm                  remove this project's agentbox containers and exit
-  --installed           list the apt packages installed in this project's
-                        container since it was made, which a rebuild would
-                        drop, and exit
+  --installed           list what was installed in this project's container
+                        since it was made, which a rebuild would drop: apt
+                        packages, then files added in home folders, /usr/local
+                        and /opt (by pip, npm -g, uv, nvm or by hand); and exit
   --config FILE         use FILE as devcontainer.json
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
@@ -143,20 +144,35 @@ rather than guess.
 
 To keep what you or an agent installed, put it in `devcontainer.json` (a
 feature, `postCreateCommand` or the Dockerfile) before the container is
-recreated. `agentbox --installed` lists the apt packages to move there:
+recreated. `agentbox --installed` lists what to move there: the apt packages,
+then the files other installers or you added:
 
 ```
 $ agentbox --installed
 cowsay
 agentbox: to keep these through a rebuild, install them from devcontainer.json, for example:
   "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cowsay"
+/home/vscode/.local/bin/uv
+/home/vscode/.local/bin/uvx
+/home/vscode/.local/share/uv
+/home/vscode/.nvm
+/usr/local/bin/mytool
+agentbox: these files were added outside apt; to keep them through a rebuild, install what
+  made them from devcontainer.json too, with a feature (containers.dev/features) or postCreateCommand
 ```
 
-It compares the container's dpkg database with its image's, so it also works
-while the container is stopped. It lists only the packages installed on
-purpose, not the dependencies apt pulled in, and includes those the
-definition's own start commands installed. Only apt is covered (Debian and
-Ubuntu images), not `pip`, `npm -g` or files put in place by hand.
+It compares the container with its image, so it also works while the
+container is stopped, and it includes what the definition's own start commands
+installed, which a rebuild puts back anyway. Of the apt packages, it lists only
+those installed on purpose, not the dependencies apt pulled in. Files are
+those `docker diff` reports added in home folders, `/usr/local` and `/opt`,
+each shown by its topmost new folder, so all of `~/.nvm` is one line; in
+`~/.local`, `~/.config`, `~/.ssh` and `/usr/local/lib/node_modules`, it shows
+what's inside. Left out are the volumes and the project folder, which a
+rebuild keeps, caches such as `~/.cache` and `~/.npm`, shell history and the
+host keys ssh accepted, folders with no files in them, and files that were
+changed rather than added, such as the line an installer appends to
+`~/.bashrc`. Only Debian and Ubuntu images are covered.
 
 ## Settings
 

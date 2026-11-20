@@ -49,9 +49,10 @@ Options (before AGENT; arguments after it go to the agent):
   --rebuild             recreate the container from its definition, then continue
   --shell               open a shell in the container instead of an agent
   --rm                  remove this project's agentbox containers and exit
-  --installed           list the apt packages installed in this project's
-                        container since it was made, which a rebuild would
-                        drop, and exit
+  --installed           list what was installed in this project's container
+                        since it was made, which a rebuild would drop: apt
+                        packages, then files added in home folders, /usr/local
+                        and /opt (by pip, npm -g, uv, nvm or by hand); and exit
   --config FILE         use FILE as devcontainer.json
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
@@ -189,10 +190,13 @@ if $remove; then
   exit 0
 fi
 
-# Packages that are in the container's dpkg database but not its image's were
-# installed since the container was made, by its start commands or by hand. Of
-# those, apt's own list drops the ones it pulled in as dependencies. docker cp
-# works on stopped containers too, so nothing has to run.
+# What a rebuild would drop, found by comparing the container with its image;
+# docker cp and docker diff work on stopped containers too, so nothing has to
+# run. Packages that are in the container's dpkg database but not its image's
+# were installed since the container was made, by its start commands or by
+# hand; of those, apt's own list drops the ones it pulled in as dependencies.
+# Everything else (pip, npm -g, uv, nvm, files put in place by hand) shows up
+# as files docker diff reports added outside the volumes.
 if $installed; then
   existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=agentbox.config=$config_label" | head -n1)
   [[ -n $existing ]] || die "no container for $root yet"
@@ -209,12 +213,64 @@ if $installed; then
   auto=$(read_file "$existing" /var/lib/apt/extended_states |
     awk -v RS= '/\nAuto-Installed: 1/ { sub(/^Package: /, ""); sub(/\n.*/, ""); print }' | LC_ALL=C sort -u || true)
   new=$(LC_ALL=C comm -13 <(echo "$before") <(echo "$now") | LC_ALL=C comm -23 - <(echo "$auto") | grep . || true)
-  if [[ -z $new ]]; then
-    echo "agentbox: no apt packages installed in this project's container since it was made" >&2
-  else
+
+  # Files added in home folders, /usr/local and /opt, where installers other
+  # than apt put things, each shown by its topmost new folder (all of ~/.nvm is
+  # one line). Folders where installers put things side by side, such as
+  # ~/.local/bin, are shown by what's in them instead. Left out: mount points
+  # and the folders docker made to hold them (their contents aren't in diff's
+  # output to begin with), caches, what dev containers and agentbox add
+  # themselves (~/.gemini is the antigravity profile's link into its volume),
+  # what any session leaves (shell history, the host keys ssh accepted), and
+  # files changed rather than added, which the dev container's own edits to
+  # ~/.bashrc and the like would drown out.
+  tops=$(docker diff "$existing" |
+    mounted=$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$existing") awk '
+    BEGIN {
+      n = split(ENVIRON["mounted"], m, "\n")
+      for (i = 1; i <= n; i++) for (p = m[i]; p != ""; sub(/\/[^\/]*$/, "", p)) skip[p] = 1
+      watched = "^/(usr/local|opt|root|home)/"
+      noise = "^/(root|home/[^/]+)/(\\.(cache|npm|devcontainer|vscode-server|gemini)(/|$)|\\.bash_history$|\\.ssh/known_hosts$)"
+      through = "^(/(root|home/[^/]+)/\\.(local(/(bin|lib|share))?|config|ssh)|/usr/local/lib/node_modules)$"
+    }
+    /^A / { p = substr($0, 3); if (!(p in skip)) added[p] = 1 }
+    END {
+      for (p in added) {
+        if (p !~ watched || p ~ noise || p ~ through) continue
+        q = p
+        while (sub(/\/[^\/]*$/, "", q) && q != "")
+          if ((q in added) && q !~ through) break
+        if (q == "") print p
+      }
+    }' | LC_ALL=C sort)
+  # Package scripts make some empty folders, such as
+  # /usr/local/lib/python3.x/dist-packages; a folder with no files in it loses
+  # nothing. Reading stops at the first file, which makes docker cp fail, so
+  # its failure counts only when no file was found: a path that can't be read
+  # is shown rather than hidden.
+  has_files() (
+    set +e
+    docker cp "$existing:$1" - 2>/dev/null | tar -tvf - 2>/dev/null | grep -q '^[^d]'
+    s=("${PIPESTATUS[@]}")
+    ((s[2] == 0 || s[0] != 0 || s[1] != 0))
+  )
+  files=
+  while IFS= read -r p; do
+    [[ -n $p ]] && has_files "$p" && files+=$p$'\n'
+  done <<<"$tops"
+
+  if [[ -z $new && -z $files ]]; then
+    echo "agentbox: nothing installed in this project's container since it was made" >&2
+  fi
+  if [[ -n $new ]]; then
     echo "$new"
     echo "agentbox: to keep these through a rebuild, install them from devcontainer.json, for example:" >&2
     echo "  \"postCreateCommand\": \"sudo apt-get update && sudo apt-get install -y $(paste -sd' ' <<<"$new")\"" >&2
+  fi
+  if [[ -n $files ]]; then
+    printf '%s' "$files"
+    echo "agentbox: these files were added outside apt; to keep them through a rebuild, install what" >&2
+    echo "  made them from devcontainer.json too, with a feature (containers.dev/features) or postCreateCommand" >&2
   fi
   exit 0
 fi
