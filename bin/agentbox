@@ -49,6 +49,9 @@ Options (before AGENT; arguments after it go to the agent):
   --rebuild             recreate the container from its definition, then continue
   --shell               open a shell in the container instead of an agent
   --rm                  remove this project's agentbox containers and exit
+  --installed           list the apt packages installed in this project's
+                        container since it was made, which a rebuild would
+                        drop, and exit
   --config FILE         use FILE as devcontainer.json
   --share-history       share chat history with the agents on the host (those
                         whose profile supports it); this project keeps sharing
@@ -87,13 +90,14 @@ case ${AGENTBOX_SHARE_HISTORY:-no} in
   *) die "AGENTBOX_SHARE_HISTORY in $CONF must be yes or no" ;;
 esac
 
-rebuild=false shell=false remove=false keep=false yes=false config= share_flag= ssh=false
+rebuild=false shell=false remove=false installed=false keep=false yes=false config= share_flag= ssh=false
 while (($#)); do
   case $1 in
     --rebuild) rebuild=true ;;
     -y|--yes) yes=true ;;
     --shell) shell=true ;;
     --rm) remove=true ;;
+    --installed) installed=true ;;
     --keep-running) keep=true ;;
     --share-history) share_flag=true ;;
     --no-share-history) share_flag=false ;;
@@ -119,7 +123,7 @@ if [[ $(basename -- "$0") == claudebox ]]; then
   agent=claude
 elif (($#)); then
   agent=$1; shift
-elif ! $shell && ! $remove; then
+elif ! $shell && ! $remove && ! $installed; then
   usage >&2; exit 2
 fi
 [[ -z $agent || -f $AGENTBOX_HOME/agents/$agent.sh ]] ||
@@ -181,6 +185,36 @@ if $remove; then
     echo "agentbox: removed containers for $root"
   else
     echo "agentbox: no containers for $root"
+  fi
+  exit 0
+fi
+
+# Packages that are in the container's dpkg database but not its image's were
+# installed since the container was made, by its start commands or by hand. Of
+# those, apt's own list drops the ones it pulled in as dependencies. docker cp
+# works on stopped containers too, so nothing has to run.
+if $installed; then
+  existing=$(docker ps -aq --filter "label=agentbox.folder=$root" --filter "label=agentbox.config=$config_label" | head -n1)
+  [[ -n $existing ]] || die "no container for $root yet"
+  # The packages a dpkg status file has installed, one per line.
+  dpkg_installed() {
+    awk -v RS= '/\nStatus: install ok installed/ { sub(/^Package: /, ""); sub(/\n.*/, ""); print }' | LC_ALL=C sort -u
+  }
+  read_file() { docker cp "$1:$2" - 2>/dev/null | tar -xO; }
+  now=$(read_file "$existing" /var/lib/dpkg/status | dpkg_installed) ||
+    die "the container has no dpkg database; --installed knows only apt (Debian, Ubuntu)"
+  probe=$(docker create "$(docker inspect -f '{{.Image}}' "$existing")")
+  before=$(read_file "$probe" /var/lib/dpkg/status | dpkg_installed || true)
+  docker rm "$probe" >/dev/null
+  auto=$(read_file "$existing" /var/lib/apt/extended_states |
+    awk -v RS= '/\nAuto-Installed: 1/ { sub(/^Package: /, ""); sub(/\n.*/, ""); print }' | LC_ALL=C sort -u || true)
+  new=$(LC_ALL=C comm -13 <(echo "$before") <(echo "$now") | LC_ALL=C comm -23 - <(echo "$auto") | grep . || true)
+  if [[ -z $new ]]; then
+    echo "agentbox: no apt packages installed in this project's container since it was made" >&2
+  else
+    echo "$new"
+    echo "agentbox: to keep these through a rebuild, install them from devcontainer.json, for example:" >&2
+    echo "  \"postCreateCommand\": \"sudo apt-get update && sudo apt-get install -y $(paste -sd' ' <<<"$new")\"" >&2
   fi
   exit 0
 fi
